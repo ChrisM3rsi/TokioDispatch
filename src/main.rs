@@ -2,43 +2,44 @@ pub mod manager;
 pub mod message;
 pub mod types;
 
-use std::{io::Lines, net::SocketAddr};
-
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
+    signal,
     sync::{
         mpsc::{self, Sender},
         oneshot,
     },
 };
 use tokio_stream::{StreamExt, StreamMap, wrappers::BroadcastStream};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
 
 use crate::{
     manager::Manager,
-    message::Message,
-    types::{ClientEvent, ManagerEvent},
+    types::{ClientEvent, ManagerEvent, Message},
 };
+const SERVER_SOCKET: &str = "127.0.0.1:8080";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //TODO: add gracefull handling using cancellation token passing it inside manager and tokio Select the listening loop
-    const SERVER_SOCKET: &str = "127.0.0.1:8080";
+    let ct = CancellationToken::new();
+
+    tokio::spawn(cancellation_listener(ct.clone()));
 
     let (event_tx, event_rx) = mpsc::channel::<ManagerEvent>(32);
 
     let manager = Manager::new(event_rx);
 
-    tokio::spawn(async move {
-        manager.run().await;
-    });
+    tokio::spawn(manager.run(ct.clone()));
 
     let listener = TcpListener::bind(SERVER_SOCKET).await?;
-    println!("Server running on {}", SERVER_SOCKET); //TODO: add logging, investigate logging for best performance on tasks
+    info!("Server running on {}", SERVER_SOCKET);
 
     loop {
         let (socket, addr) = listener.accept().await?;
-        println!("New client connected: {}", addr);
+        info!("New client connected: {}", addr);
 
         let client_tx = event_tx.clone();
 
@@ -70,9 +71,9 @@ async fn handle_client(socket: TcpStream, manager_tx: Sender<ManagerEvent>) {
                         line.clear();
                     }
                     Err(msg) =>  {
-                        println!("error: {}", msg);
+                        error!("error: {}", msg);
                         break
-                    } // Read error
+                    }
                 }
             }
 
@@ -87,7 +88,7 @@ async fn handle_client(socket: TcpStream, manager_tx: Sender<ManagerEvent>) {
                         }
                      },
                      Err(e) => {
-                        println!("error: {}", e);
+                        error!("error: {}", e);
                       }
                  }
             }
@@ -161,6 +162,18 @@ async fn handle_event(
                 todo!();
             }
             _ => None,
+        }
+    }
+}
+
+async fn cancellation_listener(ct: CancellationToken) {
+    match signal::ctrl_c().await {
+        Ok(()) => {
+            ct.cancel();
+        }
+        Err(err) => {
+            error!("Unable to listen for shutdown signal: {}", err);
+            ct.cancel();
         }
     }
 }

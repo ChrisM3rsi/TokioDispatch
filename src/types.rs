@@ -1,6 +1,5 @@
 use tokio::sync::{broadcast, oneshot};
 
-use crate::message::Message;
 
 pub enum ManagerEvent {
     // "I want to subscribe to topic 'rust'"
@@ -23,4 +22,9 @@ pub enum ClientEvent {
     Subscribe { topic: String },
     Publish { message: Message },
     ListTopics,
+}
+
+pub struct Message {
+    pub topic: String,
+    pub text: String
 }
