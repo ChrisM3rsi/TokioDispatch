@@ -1,5 +1,6 @@
-pub mod event;
 pub mod manager;
+pub mod message;
+pub mod types;
 
 use std::{io::Lines, net::SocketAddr};
 
@@ -11,12 +12,20 @@ use tokio::{
         oneshot,
     },
 };
+use tokio_stream::{StreamExt, StreamMap, wrappers::BroadcastStream};
 
-use crate::{event::Event, manager::Manager};
+use crate::{
+    manager::Manager,
+    message::Message,
+    types::{ClientEvent, ManagerEvent},
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (event_tx, event_rx) = mpsc::channel::<Event>(32);
+    //TODO: add gracefull handling using cancellation token passing it inside manager and tokio Select the listening loop
+    const SERVER_SOCKET: &str = "127.0.0.1:8080";
+
+    let (event_tx, event_rx) = mpsc::channel::<ManagerEvent>(32);
 
     let manager = Manager::new(event_rx);
 
@@ -24,8 +33,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         manager.run().await;
     });
 
-    let listener = TcpListener::bind("127.0.0.1:8080").await?;
-    println!("Server running on 127.0.0.1:8080");
+    let listener = TcpListener::bind(SERVER_SOCKET).await?;
+    println!("Server running on {}", SERVER_SOCKET); //TODO: add logging, investigate logging for best performance on tasks
 
     loop {
         let (socket, addr) = listener.accept().await?;
@@ -34,18 +43,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let client_tx = event_tx.clone();
 
         tokio::spawn(async move {
-            handle_client(socket, client_tx, addr).await;
+            handle_client(socket, client_tx).await;
         });
     }
 }
 
-async fn handle_client(socket: TcpStream, manager_tx: Sender<Event>, addr: SocketAddr) {
+async fn handle_client(socket: TcpStream, manager_tx: Sender<ManagerEvent>) {
     let (read_half, mut write_half) = socket.into_split();
-
-    let (client_tx, mut client_rx) = mpsc::channel::<String>(100);
 
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
+
+    let mut subscriptions = StreamMap::<String, BroadcastStream<String>>::new(); //TODO: create model
 
     loop {
         tokio::select! {
@@ -56,9 +65,9 @@ async fn handle_client(socket: TcpStream, manager_tx: Sender<Event>, addr: Socke
                     Ok(_) => {
                         let trimmed = line.trim();
                         if !trimmed.is_empty() {
-                            handle_command(trimmed, &manager_tx, &client_tx).await;
+                            handle_event(trimmed, &manager_tx, &mut subscriptions, &mut write_half).await;
                         }
-                        line.clear(); // IMPORTANT: Clear for next iteration
+                        line.clear();
                     }
                     Err(msg) =>  {
                         println!("error: {}", msg);
@@ -68,61 +77,90 @@ async fn handle_client(socket: TcpStream, manager_tx: Sender<Event>, addr: Socke
             }
 
             // BRANCH B: Messages to send to the user
-            Some(msg) = client_rx.recv() => {
-                if write_half.write_all(msg.as_bytes()).await.is_err() {
-                    break; // Write error - client gone
-                }
+            Some((topic, msg_result)) = subscriptions.next() => {
+                 match msg_result  {
+                     Ok(msg) =>  {
+                        let client_msg = format!("From: {}: {}",topic, msg);
+
+                        if write_half.write_all(client_msg.as_bytes()).await.is_err() {
+                            break; // Write error - client gone
+                        }
+                     },
+                     Err(e) => {
+                        println!("error: {}", e);
+                      }
+                 }
             }
         }
     }
 }
 
-async fn handle_command(
+async fn handle_event(
     input: &str,
-    manager_tx: &mpsc::Sender<Event>,
-    client_tx: &mpsc::Sender<String>,
+    manager_tx: &mpsc::Sender<ManagerEvent>,
+    subscriptions: &mut StreamMap<String, BroadcastStream<String>>,
+    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
 ) {
-    let mut parts = input.splitn(3, ' ');
-    let cmd_name = parts.next().unwrap_or("");
+    let client_event = deserialize_input(input);
 
-    match cmd_name {
-        "SUB" => {
-            let topic = parts.next().unwrap_or("default").to_string();
-            let topic_clone = topic.clone();
+    match client_event {
+        Some(evnt) => match evnt {
+            ClientEvent::Subscribe { topic } => {
+                if subscriptions.contains_key(&topic) {
+                    let msg = format!("Already subscribed to {}\n", topic);
+                    let _ = write_half.write_all(msg.as_bytes()).await;
+                    return;
+                }
 
-            let (resp_tx, resp_rx) = oneshot::channel();
-            let cmd = Event::Subscribe {
-                topic: topic.clone(),
-                resp: resp_tx,
-            };
+                let (resp_tx, resp_rx) = oneshot::channel();
 
-            if manager_tx.send(cmd).await.is_ok() {
-                if let Ok(mut broadcast_rx) = resp_rx.await {
-                    // Bridge task: broadcast -> client_tx
-                    let my_client_tx = client_tx.clone();
-                    tokio::spawn(async move {
-                        while let Ok(msg) = broadcast_rx.recv().await {
-                            let formatted = format!("From {}: {}\n", topic_clone, msg);
-                            if my_client_tx.send(formatted).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-                    let _ = client_tx.send(format!("Subscribed to {}\n", topic)).await;
+                let evnt = ManagerEvent::Subscribe {
+                    topic: topic.clone(),
+                    resp: resp_tx,
+                };
+
+                if manager_tx.send(evnt).await.is_ok() {
+                    if let Ok(broadcast_rx) = resp_rx.await {
+                        subscriptions.insert(topic.clone(), BroadcastStream::new(broadcast_rx));
+
+                        let msg = format!("Subscribed to {}\n", topic);
+                        let _ = write_half.write_all(msg.as_bytes()).await;
+                    }
                 }
             }
+            ClientEvent::Publish { message } => {
+                let cmd = ManagerEvent::Publish { message };
+                let _ = manager_tx.send(cmd).await;
+            }
+            ClientEvent::ListTopics => todo!(),
+        },
+        None => {
+            let msg = "Unknown command. Use SUB <topic> or PUB <topic> <msg>\n";
+            let _ = write_half.write_all(msg.as_bytes()).await;
         }
-        "PUB" => {
-            let topic = parts.next().unwrap_or("default").to_string();
-            let message = parts.next().unwrap_or("").to_string();
+    }
 
-            let cmd = Event::Publish { topic, message };
-            let _ = manager_tx.send(cmd).await;
-        }
-        _ => {
-            let _ = client_tx
-                .send("Unknown command. Use SUB <topic> or PUB <topic> <msg>\n".to_string())
-                .await;
+    fn deserialize_input(input: &str) -> Option<ClientEvent> {
+        let mut parts = input.splitn(3, ' ');
+        let cmd_name = parts.next().unwrap(); //TODO: convert to upper case 
+
+        match cmd_name {
+            "SUB" => {
+                let topic = parts.next().unwrap_or("default").to_string();
+                Some(ClientEvent::Subscribe { topic })
+            }
+            "PUB" => {
+                let topic = parts.next().unwrap_or("default").to_string();
+                let text = parts.next().unwrap_or("").to_string();
+
+                Some(ClientEvent::Publish {
+                    message: Message { text, topic },
+                })
+            }
+            "LIST" => {
+                todo!();
+            }
+            _ => None,
         }
     }
 }
