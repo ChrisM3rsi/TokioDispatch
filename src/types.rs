@@ -1,6 +1,7 @@
 use tokio::sync::{broadcast, oneshot};
 
 
+#[derive(Debug)]
 pub enum ManagerEvent {
     // "I want to subscribe to topic 'rust'"
     Subscribe {
@@ -24,6 +25,8 @@ pub enum ClientEvent {
     ListTopics,
 }
 
+
+#[derive(Debug)]
 pub struct Message {
     pub topic: String,
     pub text: String

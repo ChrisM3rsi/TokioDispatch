@@ -12,18 +12,22 @@ use tokio::{
     },
 };
 use tokio_stream::{StreamExt, StreamMap, wrappers::BroadcastStream};
-use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tracing::{Instrument, debug_span, error, info};
 
 use crate::{
     manager::Manager,
     types::{ClientEvent, ManagerEvent, Message},
 };
 const SERVER_SOCKET: &str = "127.0.0.1:8080";
+const TRACING_LEVEL: tracing::Level = tracing::Level::DEBUG;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    //TODO: add gracefull handling using cancellation token passing it inside manager and tokio Select the listening loop
+    tracing_subscriber::fmt()
+        .with_max_level(TRACING_LEVEL)
+        .init();
+
     let ct = CancellationToken::new();
 
     tokio::spawn(cancellation_listener(ct.clone()));
@@ -32,37 +36,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let manager = Manager::new(event_rx);
 
-    tokio::spawn(manager.run(ct.clone()));
+    tokio::spawn(manager.run(ct.clone()).instrument(debug_span!("Manager")));
 
     let listener = TcpListener::bind(SERVER_SOCKET).await?;
     info!("Server running on {}", SERVER_SOCKET);
 
+    let tracker = TaskTracker::new();
+
     loop {
-        let (socket, addr) = listener.accept().await?;
-        info!("New client connected: {}", addr);
+        tokio::select! {
+            res = listener.accept() => {
+                match res {
+                    Ok((socket, addr)) => {
+                        info!("New client connected: {}", addr);
+                        let client_tx = event_tx.clone();
+                          tracker.spawn(handle_client(socket, client_tx));
+                    }
 
-        let client_tx = event_tx.clone();
+                    Err(e) => { error!("Failed to accept connection: {}", e); }
+                }
+            }
+             _ = ct.cancelled() => {
+                info!("Shutting down accept loop");
+                break;
+            }
 
-        tokio::spawn(async move {
-            handle_client(socket, client_tx).await;
-        });
+        };
     }
+
+    tracker.close();
+    tracker.wait().await;
+    info!("Handled all pending messages");
+    Ok(())
 }
 
 async fn handle_client(socket: TcpStream, manager_tx: Sender<ManagerEvent>) {
     let (read_half, mut write_half) = socket.into_split();
-
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
 
     let mut subscriptions = StreamMap::<String, BroadcastStream<String>>::new(); //TODO: create model
 
     loop {
+        // client input 
         tokio::select! {
-            // BRANCH A: Read from user's keyboard
             result = reader.read_line(&mut line) => {
                 match result {
-                    Ok(0) => break, // EOF - client disconnected
+                    Ok(0) => break,
                     Ok(_) => {
                         let trimmed = line.trim();
                         if !trimmed.is_empty() {
@@ -77,7 +97,7 @@ async fn handle_client(socket: TcpStream, manager_tx: Sender<ManagerEvent>) {
                 }
             }
 
-            // BRANCH B: Messages to send to the user
+            // client response
             Some((topic, msg_result)) = subscriptions.next() => {
                  match msg_result  {
                      Ok(msg) =>  {
