@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
+use tracing::debug;
 
 use crate::types::ManagerEvent;
 
@@ -44,6 +45,7 @@ impl Manager {
         loop {
             tokio::select! {
                 Some(evnt) = self.event_rx.recv() =>  {
+                    debug!("handling event: {:?}", evnt);
                     self.handle_event(evnt).await;
             }
 
