@@ -4,10 +4,10 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use crate::types::ManagerEvent;
+use crate::types::{ManagerEvent, ServerResponse};
 
 pub struct Manager {
-    topics: HashMap<String, broadcast::Sender<String>>,
+    topics: HashMap<String, broadcast::Sender<ServerResponse>>,
     event_rx: mpsc::Receiver<ManagerEvent>,
 }
 
@@ -31,7 +31,7 @@ impl Manager {
             }
             ManagerEvent::Publish { message } => {
                 if let Some(tx) = self.topics.get(&message.topic) {
-                    tx.send(message.text).unwrap(); //TODO: remove unwrap
+                    tx.send(ServerResponse::NewMessage(message)).unwrap(); //TODO: remove unwrap
                 }
             }
             ManagerEvent::ListTopics { resp } => {
@@ -44,7 +44,7 @@ impl Manager {
     pub async fn run(mut self, ct: CancellationToken) {
         loop {
             tokio::select! {
-                Some(evnt) = self.event_rx.recv() =>  {
+                Some(evnt) = self.event_rx.recv() =>  { //TODO: should this be parallel? Each client communicates with manager via a single channel, is this considered bottleneck?
                     debug!("handling event: {:?}", evnt);
                     self.handle_event(evnt).await;
             }
@@ -62,7 +62,7 @@ impl Manager {
         }
 
         for (_, broadcast) in self.topics {
-            let _ = broadcast.send("Server closed, GN".to_string());
+            let _ = broadcast.send(ServerResponse::Gn);
         }
     }
 }
