@@ -1,8 +1,6 @@
 pub mod manager;
-pub mod message;
 pub mod types;
 
-use serde_json::to_string;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
@@ -21,7 +19,7 @@ use crate::{
     types::{ClientEvent, ManagerEvent, Message, ServerResponse},
 };
 const SERVER_SOCKET: &str = "127.0.0.1:8080";
-const TRACING_LEVEL: tracing::Level = tracing::Level::DEBUG;
+const TRACING_LEVEL: tracing::Level = tracing::Level::INFO;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -178,9 +176,11 @@ async fn handle_event(
             ClientEvent::ListTopics => {
                 let (resp_tx, resp_rx) = oneshot::channel();
 
-                let _ = manager_tx.send(ManagerEvent::ListTopics { resp: (resp_tx) }).await;
+                let _ = manager_tx
+                    .send(ManagerEvent::ListTopics { resp: (resp_tx) })
+                    .await;
 
-                 if let Ok(subscriptions) = resp_rx.await {
+                if let Ok(subscriptions) = resp_rx.await {
                     return ServerResponse::ListSubscriptions(subscriptions);
                 }
                 ServerResponse::ListSubscriptions(vec![])
@@ -209,9 +209,7 @@ fn deserialize_input(input: &str) -> Option<ClientEvent> {
                 message: Message { text, topic },
             })
         }
-        "LIST" => {
-            Some(ClientEvent::ListTopics)
-        }
+        "LIST" => Some(ClientEvent::ListTopics),
         _ => None,
     }
 }
