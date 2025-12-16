@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, oneshot};
 
-
 #[derive(Debug)]
 pub enum ManagerEvent {
     Subscribe {
@@ -23,11 +22,10 @@ pub enum ClientEvent {
     ListTopics,
 }
 
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Message {
     pub topic: String,
-    pub text: String
+    pub text: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -39,12 +37,11 @@ pub enum ServerResponse {
     Unsubscribed(String),
     NewMessage(Message),
     ListSubscriptions(Vec<String>),
-    Gn
-
+    Gn,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ServerError {
     pub message: String,
-    pub code: u32
+    pub code: u32,
 }
