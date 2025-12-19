@@ -1,14 +1,14 @@
 pub mod manager;
 pub mod types;
+pub mod topic_tree;
+pub mod client;
+
 
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     signal,
-    sync::{
-        mpsc::{self, Sender},
-        oneshot,
-    },
+    sync::{broadcast::{self, Receiver}, mpsc::{self, Sender}, oneshot},
 };
 use tokio_stream::{StreamExt, StreamMap, wrappers::BroadcastStream};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -16,10 +16,10 @@ use tracing::{Instrument, debug_span, error, info};
 
 use crate::{
     manager::Manager,
-    types::{ClientEvent, ManagerEvent, Message, ServerResponse},
+    types::{ClientEvent, ManagerEvent, Message, ServerResponse, SystemEvents},
 };
 const SERVER_SOCKET: &str = "127.0.0.1:8080";
-const TRACING_LEVEL: tracing::Level = tracing::Level::INFO;
+const TRACING_LEVEL: tracing::Level = tracing::Level::DEBUG;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -33,10 +33,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(cancellation_listener(ct.clone()));
 
     let (event_tx, event_rx) = mpsc::channel::<ManagerEvent>(32);
+    let (system_tx, _) = broadcast::channel::<SystemEvents>(5);
 
-    let manager = Manager::new(event_rx);
-
-    tokio::spawn(manager.run(ct.clone()).instrument(debug_span!("Manager")));
+    let manager = Manager::new(event_rx, system_tx.clone());
+    
+    tokio::spawn(
+        manager
+            .run(ct.clone())
+            .instrument(debug_span!("Manager")),
+    );
 
     let listener = TcpListener::bind(SERVER_SOCKET).await?;
     info!("Server running on {}", SERVER_SOCKET);
@@ -50,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok((socket, addr)) => {
                         info!("New client connected: {}", addr);
                         let client_tx = event_tx.clone();
-                          tracker.spawn(handle_client(socket, client_tx));
+                        tracker.spawn(handle_client(socket, client_tx, system_tx.subscribe()));
                     }
 
                     Err(e) => { error!("Failed to accept connection: {}", e); }
@@ -62,15 +67,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
         };
+   
     }
-
     tracker.close();
     tracker.wait().await;
     info!("Handled all pending messages");
     Ok(())
 }
 
-async fn handle_client(socket: TcpStream, manager_tx: Sender<ManagerEvent>) {
+async fn handle_client(socket: TcpStream, manager_tx: Sender<ManagerEvent>, mut system_rx: Receiver<SystemEvents>) {
     let (read_half, mut write_half) = socket.into_split();
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
@@ -106,16 +111,11 @@ async fn handle_client(socket: TcpStream, manager_tx: Sender<ManagerEvent>) {
             Some((_, msg_result)) = subscriptions.next() => {
                  match msg_result  {
                      Ok(msg) =>  {
-
                         let json = serde_json::to_string(&msg).unwrap();
-
                         if write_half.write_all(json.as_bytes()).await.is_err() {
                             break; // Write error - client gone
                         }
 
-                        if msg == ServerResponse::Gn {
-                            break;
-                        }
                      },
                      Err(e) => {
                         let response = ServerResponse::Error("Unexpected error".to_string());
@@ -128,6 +128,15 @@ async fn handle_client(socket: TcpStream, manager_tx: Sender<ManagerEvent>) {
                  }
             }
 
+            Ok(msg) = system_rx.recv() => {
+                match msg {
+                    SystemEvents::Gn => {
+                        let json = serde_json::to_string(&ServerResponse::Gn).unwrap();
+                        let _ = write_half.write_all(json.as_bytes()).await;
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -166,24 +175,22 @@ async fn handle_event(
                     Err(e) => ServerResponse::Error(e.to_string()),
                 }
             }
-
             ClientEvent::Publish { message } => {
                 let cmd = ManagerEvent::Publish { message };
                 let _ = manager_tx.send(cmd).await;
                 return ServerResponse::Ok;
             }
-
             ClientEvent::ListTopics => {
-                let (resp_tx, resp_rx) = oneshot::channel();
+                let messages: Vec<String> = subscriptions
+                    .keys()
+                    .map(|x| x.clone())
+                    .collect();
 
-                let _ = manager_tx
-                    .send(ManagerEvent::ListTopics { resp: (resp_tx) })
-                    .await;
-
-                if let Ok(subscriptions) = resp_rx.await {
-                    return ServerResponse::ListSubscriptions(subscriptions);
-                }
-                ServerResponse::ListSubscriptions(vec![])
+                ServerResponse::ListTopics(messages)
+            }
+            ClientEvent::Unsubscribe { topic } => {
+                subscriptions.remove(&topic);
+                ServerResponse::Ok
             }
         },
         None => ServerResponse::Error(
@@ -198,11 +205,18 @@ fn deserialize_input(input: &str) -> Option<ClientEvent> {
 
     match cmd_name {
         "SUB" => {
-            let topic = parts.next().unwrap_or("default").to_string();
+            let topic = parts
+                .next()
+                .unwrap_or("default")
+                .to_string();
+
             Some(ClientEvent::Subscribe { topic })
         }
         "PUB" => {
-            let topic = parts.next().unwrap_or("default").to_string();
+            let topic = parts
+                .next()
+                .unwrap_or("default")
+                .to_string();
             let text = parts.next().unwrap_or("").to_string();
 
             Some(ClientEvent::Publish {
@@ -210,6 +224,15 @@ fn deserialize_input(input: &str) -> Option<ClientEvent> {
             })
         }
         "LIST" => Some(ClientEvent::ListTopics),
+
+        "UNSUB" => {
+            let topic = parts
+                .next()
+                .unwrap_or("default")
+                .to_string();
+
+            Some(ClientEvent::Unsubscribe { topic })
+        }
         _ => None,
     }
 }

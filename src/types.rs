@@ -10,14 +10,11 @@ pub enum ManagerEvent {
     Publish {
         message: Message,
     },
-
-    ListTopics {
-        resp: oneshot::Sender<Vec<String>>,
-    },
 }
 
 pub enum ClientEvent {
     Subscribe { topic: String },
+    Unsubscribe {topic: String},
     Publish { message: Message },
     ListTopics,
 }
@@ -36,8 +33,13 @@ pub enum ServerResponse {
     Subscribed(String),
     Unsubscribed(String),
     NewMessage(Message),
-    ListSubscriptions(Vec<String>),
+    ListTopics(Vec<String>),
     Gn,
+}
+
+#[derive(Clone)]
+pub enum SystemEvents {
+    Gn
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

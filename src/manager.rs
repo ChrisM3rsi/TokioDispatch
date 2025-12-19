@@ -1,21 +1,27 @@
-use std::collections::HashMap;
 
-use tokio::sync::{broadcast, mpsc};
+use std::alloc::System;
+
+use tokio::sync::{broadcast::{self, Sender}, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, error};
 
-use crate::types::{ManagerEvent, ServerResponse};
+use crate::{
+    topic_tree::TopicTree,
+    types::{ManagerEvent, ServerResponse, SystemEvents},
+};
 
 pub struct Manager {
-    topics: HashMap<String, broadcast::Sender<ServerResponse>>,
+    topics: TopicTree,
     event_rx: mpsc::Receiver<ManagerEvent>,
+    system_tx: Sender<SystemEvents>
 }
 
 impl Manager {
-    pub fn new(event_rx: mpsc::Receiver<ManagerEvent>) -> Self {
+    pub fn new(event_rx: mpsc::Receiver<ManagerEvent>, system_tx: Sender<SystemEvents>) -> Self {
         Self {
-            topics: HashMap::new(),
+            topics: TopicTree::new(),
             event_rx,
+            system_tx
         }
     }
 
@@ -24,19 +30,18 @@ impl Manager {
             ManagerEvent::Subscribe { topic, resp } => {
                 let tx = self
                     .topics
-                    .entry(topic)
-                    .or_insert_with(|| broadcast::channel(100).0);
+                    .get_or_create_channel(&topic);
 
                 resp.send(tx.subscribe()).unwrap(); //TODO: remove unwrap
             }
             ManagerEvent::Publish { message } => {
-                if let Some(tx) = self.topics.get(&message.topic) {
-                    tx.send(ServerResponse::NewMessage(message)).unwrap(); //TODO: remove unwrap
+                let matches = self.topics.find_matches(&message.topic);
+                for tx in matches {
+                    match tx.send(ServerResponse::NewMessage(message.clone())) {
+                        Ok(_) => debug!("send to broadcast channel"),
+                        Err(_) => error!("Failed to send message to broadcast"),
+                    }
                 }
-            }
-            ManagerEvent::ListTopics { resp } => {
-                let topics = self.topics.keys().cloned().collect();
-                resp.send(topics).unwrap(); //TODO: remove unwrap
             }
         }
     }
@@ -47,7 +52,7 @@ impl Manager {
                 Some(evnt) = self.event_rx.recv() =>  { //TODO: should this be parallel? Each client communicates with manager via a single channel, is this considered bottleneck?
                     debug!("handling event: {:?}", evnt);
                     self.handle_event(evnt).await;
-            }
+                }
 
                 _ = ct.cancelled() => {
                     break;
@@ -58,11 +63,9 @@ impl Manager {
         self.event_rx.close();
 
         while let Some(evnt) = self.event_rx.recv().await {
-           self.handle_event(evnt).await;
+            self.handle_event(evnt).await;
         }
 
-        for (_, broadcast) in self.topics {
-            let _ = broadcast.send(ServerResponse::Gn);
-        }
+        let _ = self.system_tx.send(SystemEvents::Gn);
     }
 }
